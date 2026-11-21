@@ -1,0 +1,78 @@
+{
+  "name": "@dimassetoid/openapi-mcp",
+  "version": "0.1.0",
+  "description": "Local Code Mode MCP server and reusable OpenAPI engine for AI coding agents",
+  "publishConfig": {
+    "access": "public"
+  },
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "openapi-mcp": "./dist/index.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./engine": {
+      "types": "./dist/engine/index.d.ts",
+      "default": "./dist/engine/index.js"
+    }
+  },
+  "files": [
+    "dist/**/*.js",
+    "dist/**/*.d.ts",
+    "docs/feature",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18.20.0",
+    "bun": ">=1.4.3"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Shironim/openapi-mcp.git"
+  },
+  "homepage": "https://github.com/Shironim/openapi-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/Shironim/openapi-mcp/issues"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "openapi",
+    "swagger",
+    "code-mode",
+    "ai-agent",
+    "sandbox",
+    "schema-validation",
+    "api-contract"
+  ],
+  "author": "dimassetoid",
+  "license": "MIT",
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "serve": "bun run src/index.ts serve",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc -p tsconfig.build.json",
+    "compile:all": "bun run scripts/compile.ts",
+    "prepublishOnly": "bun run typecheck && bun run build && bun test"
+  },
+  "dependencies": {
+    "@jitl/quickjs-singlefile-cjs-release-sync": "0.32.0",
+    "@modelcontextprotocol/sdk": "^1.6.0",
+    "acorn": "8.19.0",
+    "quickjs-emscripten-core": "0.32.0",
+    "yaml": "^2.7.0",
+    "zod": "4.6.7"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.4.0",
+    "@types/node": "^22.13.4",
+    "typescript": "^5.7.3"
+  }
+}
