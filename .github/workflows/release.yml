@@ -1,0 +1,91 @@
+name: Release Standalone Binaries
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  BUN_VERSION: '1.4.3'
+
+jobs:
+  verify-package:
+    name: Verify source and npm tarball
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        node: [18.20.8, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - run: bun install --frozen-lockfile
+      - run: bun run typecheck && bun test && bun run build
+      - run: sh scripts/verify-package.sh
+
+  binaries:
+    name: Build and smoke test ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, target: linux-x64 }
+          - { runner: ubuntu-24.04-arm, target: linux-arm64 }
+          - { runner: macos-15-intel, target: darwin-x64 }
+          - { runner: macos-15, target: darwin-arm64 }
+          - { runner: windows-2025, target: windows-x64 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ env.BUN_VERSION }}
+      - run: bun install --frozen-lockfile
+      - run: bun run scripts/compile.ts ${{ matrix.target }}
+      - name: Verify the binary to be published
+        shell: bash
+        run: node scripts/smoke-stdio.mjs ./release/openapi-mcp-*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openapi-mcp-${{ matrix.target }}
+          path: release/openapi-mcp-*
+          if-no-files-found: error
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [verify-package, binaries]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify tag matches package version
+        run: test "$GITHUB_REF_NAME" = "v$(node -p 'require("./package.json").version')"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: openapi-mcp-*
+          path: release
+          merge-multiple: true
+      - name: Generate checksums for verified binaries
+        working-directory: release
+        run: sha256sum openapi-mcp-* > checksums.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/openapi-mcp-*
+            release/checksums.txt
+            scripts/install.sh
+            scripts/install.ps1
+          fail_on_unmatched_files: true
+          generate_release_notes: true
