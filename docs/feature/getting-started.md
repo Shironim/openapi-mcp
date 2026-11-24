@@ -1,34 +1,41 @@
-# Set up openapi-mcp
+# Getting Started
 
 ## Installation
 
 ### Option 1: Standalone Binary (Linux, macOS, Windows)
 
-Install precompiled single-file executables without requiring Bun or Node.js:
+Install a precompiled single-file executable with automatic SHA-256 checksum verification (no Node.js or Bun runtime required):
 
 **Linux & macOS:**
-```bash
+
+```sh
 curl -fsSL https://raw.githubusercontent.com/Shironim/openapi-mcp/master/scripts/install.sh | sh
 ```
 
 **Windows (PowerShell):**
+
 ```powershell
 irm https://raw.githubusercontent.com/Shironim/openapi-mcp/master/scripts/install.ps1 | iex
 ```
 
-> **Manual Downloads:** The GitHub release workflow builds and smoke-tests standalone binaries via `.github/workflows/release.yml` (`openapi-mcp-linux-x64`, `openapi-mcp-linux-arm64`, `openapi-mcp-darwin-x64`, `openapi-mcp-darwin-arm64`, `openapi-mcp-windows-x64.exe`, plus `checksums.txt`).
+Optional environment variables supported by both installers:
+- `OPENAPI_MCP_VERSION` — Install a specific release tag (for example `v0.1.0`; defaults to latest).
+- `OPENAPI_MCP_INSTALL_DIR` — Override the target installation directory.
+- `OPENAPI_MCP_REPO` — Override the GitHub repository slug (defaults to `Shironim/openapi-mcp`).
 
-### Option 2: Via npm / Bun (`@dimassetoid/openapi-mcp`)
+> **Manual Downloads:** [GitHub Releases](https://github.com/Shironim/openapi-mcp/releases) provides binaries for `linux-x64`, `linux-arm64`, `darwin-x64`, `darwin-arm64`, and `windows-x64.exe`, along with `checksums.txt`.
 
-The npm package requires Node.js 18.20 or later, or Bun 1.4.3 or later.
+### Option 2: npm or Bun (`@dimassetoid/openapi-mcp`)
 
-```bash
-bun add -g @dimassetoid/openapi-mcp
-# or with npm:
+Requires Node.js `>=18.20.0` or Bun `>=1.4.3`:
+
+```sh
 npm install -g @dimassetoid/openapi-mcp
+# or
+bun add -g @dimassetoid/openapi-mcp
 ```
 
-You can also invoke it without global installation via `bunx @dimassetoid/openapi-mcp serve` or `npx @dimassetoid/openapi-mcp serve`.
+You can also run without a global install via `npx @dimassetoid/openapi-mcp serve` or `bunx @dimassetoid/openapi-mcp serve`.
 
 ---
 
@@ -47,7 +54,7 @@ Add `openapi-mcp` to `.mcp.json` or your MCP client configuration:
 }
 ```
 
-Or run directly with Bun:
+Or run directly from source with Bun:
 
 ```json
 {
@@ -60,47 +67,65 @@ Or run directly with Bun:
 }
 ```
 
-You can set the workspace boundary and the default spec file:
+To pin a workspace boundary and default spec file:
 
-```bash
+```sh
 openapi-mcp serve --root /path/to/repo --spec api/openapi.yml
 ```
 
-## Work with multiple specs
+## Working with Multiple Specs (Monorepos)
 
-For a monorepo, start the server with `--root /path/to/repo`. Read `openapi://specs/catalog` to list conventional spec paths across projects. Select one path per request, for example:
+Start the server with `--root /path/to/repo`. Read `openapi://specs/catalog` to discover conventional spec paths across projects, then pass `spec_path` per request:
 
-- Index: `openapi://endpoints/index?spec_path=apps/billing/openapi.yaml`
-- Search: `openapi://endpoints/search?spec_path=apps/billing/openapi.yaml&q=invoice`
-- Query: `openapi_query({ spec_path: "apps/billing/openapi.yaml", code: "spec.info.title" })`
+- **Endpoint index:** `openapi://endpoints/index?spec_path=apps/billing/openapi.yaml`
+- **Endpoint search:** `openapi://endpoints/search?spec_path=apps/billing/openapi.yaml&q=invoice`
+- **Query:** `openapi_query({ spec_path: "apps/billing/openapi.yaml", code: "spec.info.title" })`
 
-URI-encode path values when needed. Without a selector, the server uses its configured spec or checks the conventional filenames in the root, `api/`, and `docs/`, in that order. Selections leave the default unchanged. The catalog skips symlinks, `.git`, and `node_modules`; it stops with a diagnostic above 250,000 visited entries or 1 MiB of output. A custom filename can still be selected directly.
+URI-encode path values when needed. Without `spec_path`, the server uses `--spec` (if configured) or checks conventional filenames (`openapi.yml`, `openapi.yaml`, `openapi.json`) in the workspace root, `api/`, and `docs/`, in that order. Per-request `spec_path` selections do not mutate the server default.
+
+The catalog skips symlinks, `.git`, and `node_modules` (along with other common build/cache directories) and stops with a diagnostic if traversal exceeds 250,000 entries or 1 MiB of output.
+
+---
 
 ## CLI Reference
 
+```text
+openapi-mcp <command> [options]
+```
+
 | Command | Description |
-|---|---|
+| --- | --- |
 | `openapi-mcp serve [--root <dir>] [--spec <path>]` | Start the MCP server over `stdio` |
-| `openapi-mcp` (piped stdin / `!isTTY`) | Auto-start the MCP server over `stdio` |
-| `openapi-mcp --help` / `-h` | Show usage help (written to `stderr`) |
-| `openapi-mcp --version` / `-v` | Show version (`0.1.0`, written to `stderr`) |
+| `openapi-mcp check [--root <dir>] [--spec <path>] [--strict] [--json]` | Validate an OpenAPI spec and report contract issues (exits `1` on errors, or warnings with `--strict`) |
+| `openapi-mcp diff <base> <target> [--root <dir>] [--fail-on-breaking] [--json]` | Compare two local specs for breaking changes (exits `1` on breaking changes with `--fail-on-breaking`) |
+| `openapi-mcp` (piped stdin) | Auto-start the MCP server over `stdio` |
+| `openapi-mcp -h \| --help` | Show help message (written to `stderr`) |
+| `openapi-mcp -v \| --version` | Show version number (written to `stderr`) |
 
-The CLI writes startup and shutdown messages to `stderr`. It uses `stdout` for MCP protocol messages, including tool and resource responses.
+Startup/shutdown logs, `--help`, and `--version` are written to `stderr`, keeping `stdout` clean for MCP JSON-RPC frames (`serve`) and machine-readable reports (`check`, `diff`).
 
-## Inspect an API
+---
 
-1. **Choose a spec.** In a monorepo, read `openapi://specs/catalog` to find conventional spec filenames. Pass the chosen `spec_path` to subsequent requests.
-2. **Find an operation.** Read `openapi://endpoints/index` for the full index or `openapi://endpoints/search?q=orders&limit=20` for a filtered page. Follow `nextUri` for more results.
-3. **Inspect the contract.** Call the read-only tool `openapi_query` to read parameters, request bodies, or response schemas. For example, `spec.paths['/orders']?.post?.responses?.['422']` reads the declared validation response.
+## Agent Skill
 
-The two workflow prompts, `sync-frontend-api` and `audit-error-contracts`, return instructions your agent can follow.
+Copy [skills/use-openapi-mcp/SKILL.md](../../skills/use-openapi-mcp/SKILL.md) into `.agents/skills/use-openapi-mcp/SKILL.md` (or your global agent skills directory) to provide AI coding agents with a concise routing guide for MCP resources, `helpers.*`, and `openapi_diff`.
 
-## Development & Testing
+## Inspecting an API Workflow
 
-```bash
-bun test            # Run engine unit tests and InMemoryTransport MCP contract tests
-bun run typecheck   # Run TypeScript strict type checking (tsc --noEmit)
-bun run build       # Emit npm JavaScript and declarations to dist/
-bun run compile:all # Build standalone binaries to release/
-sh scripts/verify-package.sh # Pack, install, compile a TypeScript consumer, and smoke-test stdio
+1. **Select a spec:** In a monorepo, read `openapi://specs/catalog` and pass the chosen `spec_path` to subsequent calls.
+2. **Locate an operation:** Read `openapi://endpoints/index` or query `openapi://endpoints/search?q=orders&limit=20` (follow `nextUri` for additional pages).
+3. **Inspect the contract:** Call `openapi_query` with `helpers.op('POST', '/orders')` or `helpers.example('POST', '/orders', '422')` to inspect merged parameters, auth, and response schemas.
+
+Four built-in MCP prompts (`sync-frontend-api`, `audit-error-contracts`, `review-breaking-changes`, and `generate-test-fixtures`) provide step-by-step agent workflows.
+
+---
+
+## Development & Verification
+
+```sh
+bun test                     # Run engine unit tests and InMemoryTransport MCP contract tests
+bun run typecheck            # Run TypeScript strict type checking (tsc --noEmit)
+bun run build                # Emit npm JavaScript and type declarations to dist/
+bun run compile:all          # Build standalone binaries into release/
+sh scripts/verify-package.sh # Pack, install, typecheck a TypeScript consumer, and smoke-test stdio
 ```

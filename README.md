@@ -1,70 +1,133 @@
 # openapi-mcp
 
-> **Local OpenAPI contract inspection for AI coding agents.**
+> **Local Code Mode OpenAPI server, CLI, and contract engine for AI coding agents and CI.**
 
 [![npm version](https://img.shields.io/npm/v/@dimassetoid/openapi-mcp)](https://www.npmjs.com/package/@dimassetoid/openapi-mcp)
 [![Runtime: Bun](https://img.shields.io/badge/Runtime-Bun-black?logo=bun)](https://bun.sh)
 [![Protocol: Model Context Protocol](https://img.shields.io/badge/Protocol-MCP-green)](https://modelcontextprotocol.io/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue)](LICENSE)
 
-openapi-mcp is a local MCP server that helps coding agents work with the APIs documented in your repository. It reads OpenAPI files in YAML or JSON, follows local references across files, and builds an index of operations. An agent can find an endpoint and inspect the part of its contract needed for a change.
+`openapi-mcp` is a local Model Context Protocol (MCP) server, CLI, and reusable TypeScript engine for OpenAPI 3.0/3.1 and Swagger 2.0 specifications. It lets AI coding agents and CI pipelines inspect endpoints, schemas, and contract diffs without loading entire specification files into context.
 
-## What It Does
+## Key Capabilities
 
-- **Service discovery.** The workspace catalog lists OpenAPI files across a monorepo. If Billing and Sales both define `GET /invoices`, the agent can select Billing’s specification for its request.
-- **Endpoint search.** The endpoint index shows methods, paths, summaries, and declared response statuses. Agents can search by text, tag, or operation ID and page through matching operations.
-- **Request and response inspection (`openapi_query`).** This read-only tool lets an agent inspect parameters, request bodies, and response schemas. For example, before changing a checkout form, it can look up which fields the orders API declares in its `422` response.
-- **Integration review.** The `sync-frontend-api` prompt guides an agent through comparing a frontend caller with the documented contract. The `audit-error-contracts` prompt guides it through checking which error responses declare a status and which also describe the response body.
+- **Monorepo Spec Discovery (`openapi://specs/catalog`)** — Scans workspaces for OpenAPI entry files while skipping symlinks, unreadable directories (`EACCES`/`EPERM`), and build or dependency folders (`node_modules`, `vendor`, `dist`, `.git`, etc.).
+- **Indexed Endpoints & Paginated Search (`openapi://endpoints/index`, `openapi://endpoints/search`)** — Summarizes HTTP methods, paths, `2xx`/`4xx`/`5xx` status codes, error bodies, auth schemes, deprecation flags, and `{ file, line }` source locations, soft-capped at `64 KB`.
+- **Schema Index & Reverse References (`openapi://schemas/index`, `openapi://schemas/search`)** — Lists `components.schemas` / `definitions` with required fields, properties, `unusedSchemas`, source locations, and reverse `usedBy` operation references.
+- **Single-Pass Contract Diagnostics (`openapi://spec/diagnostics`, `openapi-mcp check`)** — Reports broken `$ref`s, duplicate `operationId`s, undeclared path parameters, unknown security schemes, and missing error contracts in one pass.
+- **Sandboxed Query Engine (`openapi_query`)** — Runs read-only JavaScript in QuickJS WASM against frozen `spec` and built-in `helpers` (`helpers.op`, `helpers.example`, `helpers.schemaRefs`).
+- **Semantic Contract Diff (`openapi_diff`, `openapi-mcp diff`)** — Compares two local specifications and classifies changes into `breaking` and `nonBreaking`.
+- **MCP Prompts & Agent Skill** — Ships four guided prompts (`sync-frontend-api`, `audit-error-contracts`, `review-breaking-changes`, `generate-test-fixtures`) and a portable Agent Skill at [skills/use-openapi-mcp/SKILL.md](skills/use-openapi-mcp/SKILL.md).
 
 ## Installation
 
-Install the package with npm:
+### Standalone Binary (Recommended)
+
+Install precompiled single-file binaries for Linux, macOS, or Windows with SHA-256 verification (no Node.js or Bun required):
+
+**Linux & macOS:**
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Shironim/openapi-mcp/master/scripts/install.sh | sh
+```
+
+**Windows (PowerShell):**
+
+```powershell
+irm https://raw.githubusercontent.com/Shironim/openapi-mcp/master/scripts/install.ps1 | iex
+```
+
+You can also download archives directly from [GitHub Releases](https://github.com/Shironim/openapi-mcp/releases) (`openapi-mcp-linux-x64`, `openapi-mcp-linux-arm64`, `openapi-mcp-darwin-x64`, `openapi-mcp-darwin-arm64`, `openapi-mcp-windows-x64.exe`, and `checksums.txt`).
+
+### Via npm or Bun
+
+Requires Node.js `>=18.20.0` or Bun `>=1.4.3`:
 
 ```sh
 npm install -g @dimassetoid/openapi-mcp
+# or
+bun add -g @dimassetoid/openapi-mcp
 ```
 
-A standalone executable is also available for Linux, macOS, and Windows. [Standalone and Bun installation instructions](docs/feature/getting-started.md#installation)
+Or run without global installation:
+
+```sh
+npx @dimassetoid/openapi-mcp serve
+# or
+bunx @dimassetoid/openapi-mcp serve
+```
 
 ## Quick Start
 
-Configure your MCP client to run `openapi-mcp serve --root /path/to/repo`. Replace the path with the repository containing your OpenAPI files. Once connected, try asking your agent:
+### MCP Client Setup
 
-> Which endpoint creates an order, and what does its specification say happens when validation fails?
+Add `openapi-mcp` to your MCP client configuration (for example `.mcp.json`):
 
-For a monorepo, include the service name in your question so the agent can select its spec. [MCP client configuration](docs/feature/getting-started.md#mcp-client-configuration) · [Monorepo setup](docs/feature/getting-started.md#work-with-multiple-specs)
+```json
+{
+  "mcpServers": {
+    "openapi-mcp": {
+      "command": "openapi-mcp",
+      "args": ["serve", "--root", "/path/to/repo"]
+    }
+  }
+}
+```
+
+Once connected, ask your agent:
+
+> Which endpoint creates an order, what does its `422` validation schema look like, and what is a valid example payload?
+
+### CI & Local CLI
+
+Run contract diagnostics or breaking-change checks directly in your terminal or CI pipeline:
+
+```sh
+openapi-mcp check --root . --spec openapi.yml --strict
+openapi-mcp diff openapi.yml openapi-v2.yml --fail-on-breaking
+```
 
 ## CLI Reference
 
-| Command | Purpose |
-|---|---|
-| `openapi-mcp serve` | Start the MCP server in the current workspace. |
-| `openapi-mcp serve --root <dir> --spec <path>` | Set the workspace and default specification. |
-| `openapi-mcp --help` | Show usage and options. |
-| `openapi-mcp --version` | Print the installed version. |
+```text
+openapi-mcp <command> [options]
+```
+
+| Command | Description |
+| --- | --- |
+| `serve` | Start the MCP server over `stdio` (also starts automatically when stdin is piped) |
+| `check` | Validate an OpenAPI spec and report contract issues |
+| `diff <base> <target>` | Compare two local OpenAPI specs for breaking changes |
+
+| Option | Description |
+| --- | --- |
+| `--root <dir>` | Workspace root directory (defaults to current directory) |
+| `--spec <path>` | Path to OpenAPI spec file (`serve`, `check`) |
+| `--strict` | Exit with code `1` if warnings are found (`check`) |
+| `--fail-on-breaking` | Exit with code `1` if breaking changes are found (`diff`) |
+| `--json` | Output results as JSON (`check`, `diff`) |
+| `-h, --help` | Show help message (written to `stderr`) |
+| `-v, --version` | Show version number (written to `stderr`) |
 
 ## Documentation
 
-- [Feature overview and architecture](docs/feature/README.md)
-- [Spec selection and local references](docs/feature/spec-loader.md)
-- [Endpoint search, response summaries, and review prompts](docs/feature/index-and-prompts.md)
-- [Query examples and output limits](docs/feature/openapi-query.md)
+- [Feature Overview & Architecture](docs/feature/README.md)
+- [Getting Started, MCP Setup & CLI Reference](docs/feature/getting-started.md)
+- [Specification Loader, `$ref` Resolution & Source Mapping](docs/feature/spec-loader.md)
+- [Indexes, Diagnostics & Workflow Prompts](docs/feature/index-and-prompts.md)
+- [Code Mode Query (`openapi_query`) & Semantic Diff (`openapi_diff`)](docs/feature/openapi-query.md)
+- [Agent Skill Playbook (`use-openapi-mcp`)](skills/use-openapi-mcp/SKILL.md)
 
 ## Development
 
-```bash
-# Clone the repository and install dependencies
-git clone https://github.com/Shironim/openapi-mcp.git
-cd openapi-mcp
+```sh
 bun install
-
-# Run tests, check types, and build the package
-bun test
 bun run typecheck
+bun test
 bun run build
+bun run compile:all          # Build standalone binaries into release/
+sh scripts/verify-package.sh # Verify npm tarball, TypeScript consumer, and stdio smoke test
 ```
-
-[Standalone builds and package verification](docs/feature/getting-started.md#development--testing)
 
 ## License
 
