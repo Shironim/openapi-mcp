@@ -165,13 +165,14 @@ describe('MCP Protocol Contract (InMemoryTransport)', () => {
     }
   });
 
-  it('registers openapi_query with strict readOnly/non-destructive annotations and schema', async () => {
+  it('registers openapi_query and openapi_diff with strict readOnly/non-destructive annotations and schemas', async () => {
     const root = createFixtureProject();
     const { client, close } = await connectClientServer(root);
 
     try {
       const { tools } = await client.listTools();
-      expect(tools).toHaveLength(1);
+      expect(tools).toHaveLength(2);
+      expect(tools.map((t) => t.name)).toEqual(['openapi_query', 'openapi_diff']);
 
       const queryTool = tools[0]!;
       expect(queryTool.name).toBe('openapi_query');
@@ -185,6 +186,17 @@ describe('MCP Protocol Contract (InMemoryTransport)', () => {
       const props = queryTool.inputSchema.properties as Record<string, unknown>;
       expect(Object.keys(props).sort()).toEqual(['code', 'max_bytes', 'root', 'spec_path']);
       expect(queryTool.inputSchema.required).toEqual(['code']);
+
+      const diffTool = tools[1]!;
+      expect(diffTool.annotations).toEqual({
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      });
+      const diffProps = diffTool.inputSchema.properties as Record<string, unknown>;
+      expect(Object.keys(diffProps).sort()).toEqual(['base_spec_path', 'max_bytes', 'root', 'target_spec_path']);
+      expect((diffTool.inputSchema.required as string[]).sort()).toEqual(['base_spec_path', 'target_spec_path']);
     } finally {
       await close();
     }
@@ -326,11 +338,16 @@ describe('MCP Protocol Contract (InMemoryTransport)', () => {
 
       expect(prompts.map((p) => p.name).sort()).toEqual([
         'audit-error-contracts',
+        'generate-test-fixtures',
+        'review-breaking-changes',
         'sync-frontend-api',
       ]);
 
       for (const prompt of prompts) {
-        for (const args of [undefined, { endpoint: 'POST /orders' }]) {
+        const sampleArgs = prompt.name === 'review-breaking-changes'
+          ? [undefined, { base_spec_path: 'openapi.yml', target_spec_path: 'openapi-v2.yml' }]
+          : [undefined, { endpoint: 'POST /orders' }];
+        for (const args of sampleArgs) {
           const rendered = await client.getPrompt({
             name: prompt.name,
             ...(args ? { arguments: args } : {}),
@@ -355,14 +372,14 @@ describe('MCP Protocol Contract (InMemoryTransport)', () => {
             expect(resourceUris.has(uri)).toBe(true);
           }
 
-          // Anti-prompt-drift: every backticked parameter name called out for openapi_query must exist
-          for (const param of ['code', 'spec_path', 'root', 'max_bytes']) {
+          // Anti-prompt-drift: every backticked parameter name called out must exist
+          for (const param of ['code', 'spec_path', 'root', 'max_bytes', 'base_spec_path', 'target_spec_path']) {
             if (fullText.includes(`\`${param}\``)) {
               expect(toolParamNames.has(param)).toBe(true);
             }
           }
 
-          if (args?.endpoint) {
+          if (args && 'endpoint' in args && args.endpoint) {
             expect(fullText).toContain('/orders');
           }
         }
@@ -467,6 +484,63 @@ describe('MCP Protocol Contract (InMemoryTransport)', () => {
       await close();
     }
   });
+
+  it('serves schemas/index, spec/diagnostics, sandbox helpers, and openapi_diff over MCP', async () => {
+    const root = createFixtureProject();
+    writeFileSync(
+      join(root, 'openapi-v2.yml'),
+      `openapi: "3.1.0"
+info:
+  title: Checkout API
+  version: "2.0.0"
+paths:
+  /orders:
+    post:
+      operationId: createOrder
+      responses:
+        "201":
+          description: Created
+`
+    );
+    const { client, close } = await connectClientServer(root);
+
+    try {
+      const { resources } = await client.listResources();
+      const uris = resources.map((r) => r.uri);
+      expect(uris).toContain('openapi://schemas/index');
+      expect(uris).toContain('openapi://spec/diagnostics');
+
+      const schemasRes = await client.readResource({ uri: 'openapi://schemas/index' });
+      const schemasPayload = JSON.parse((schemasRes.contents[0] as { text: string }).text);
+      expect(schemasPayload.title).toBe('Checkout API');
+      expect(schemasPayload.totalSchemas).toBe(0);
+
+      const diagRes = await client.readResource({ uri: 'openapi://spec/diagnostics' });
+      const diagPayload = JSON.parse((diagRes.contents[0] as { text: string }).text);
+      expect(diagPayload.valid).toBe(true);
+      expect(diagPayload.issues.some((i: { code: string }) => i.code === 'MISSING_ERROR_CONTRACT')).toBe(true);
+
+      const helperOp = await client.callTool({
+        name: 'openapi_query',
+        arguments: { code: "helpers.op('POST', '/orders')" },
+      });
+      expect(helperOp.isError).toBeFalsy();
+      const opData = JSON.parse(extractToolText(helperOp));
+      expect(opData.operationId).toBe('createOrder');
+      expect(opData.sourceLocation.file).toBe('openapi.yml');
+
+      const diffRes = await client.callTool({
+        name: 'openapi_diff',
+        arguments: { base_spec_path: 'openapi.yml', target_spec_path: 'openapi-v2.yml' },
+      });
+      expect(diffRes.isError).toBeFalsy();
+      const diffData = JSON.parse(extractToolText(diffRes));
+      expect(diffData.hasBreakingChanges).toBe(true);
+      expect(diffData.summary.removedEndpoints).toBe(1);
+    } finally {
+      await close();
+    }
+  });
 });
 
 describe('CLI & Stdio Transport Lifecycle', () => {
@@ -537,5 +611,120 @@ describe('CLI & Stdio Transport Lifecycle', () => {
     ]);
     expect(exitCode).toBe(0);
     expect(stderrText).toContain('[openapi-mcp]');
+  });
+
+  it('runs CLI check and diff subcommands with JSON output and CI exit codes', async () => {
+    const root = createFixtureProject();
+    writeFileSync(
+      join(root, 'openapi-v2.yml'),
+      `openapi: "3.1.0"
+info:
+  title: Checkout API
+  version: "2.0.0"
+paths:
+  /orders:
+    post:
+      operationId: createOrder
+      responses:
+        "201":
+          description: Created
+`
+    );
+
+    const runCli = async (args: string[]) => {
+      const proc = Bun.spawn([process.execPath, 'run', 'src/index.ts', ...args], {
+        cwd: PROJECT_ROOT,
+        stdin: 'ignore',
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
+      const [exitCode, stdout, stderr] = await Promise.all([
+        proc.exited,
+        new Response(proc.stdout).text(),
+        new Response(proc.stderr).text(),
+      ]);
+      return { exitCode, stdout, stderr };
+    };
+
+    // check: valid spec with 1 warning (/health missing error contract) -> exit 0 without --strict, exit 1 with --strict
+    const checkNormal = await runCli(['check', '--root', root, '--json']);
+    expect(checkNormal.exitCode).toBe(0);
+    expect(JSON.parse(checkNormal.stdout).valid).toBe(true);
+
+    const checkStrict = await runCli(['check', '--root', root, '--strict', '--json']);
+    expect(checkStrict.exitCode).toBe(1);
+    expect(JSON.parse(checkStrict.stdout).summary.warnings).toBeGreaterThan(0);
+
+    // diff: breaking change (/health removed) -> exit 0 without flag, exit 1 with --fail-on-breaking
+    const diffNormal = await runCli(['diff', 'openapi.yml', 'openapi-v2.yml', '--root', root, '--json']);
+    expect(diffNormal.exitCode).toBe(0);
+    expect(JSON.parse(diffNormal.stdout).hasBreakingChanges).toBe(true);
+
+    const diffFail = await runCli(['diff', 'openapi.yml', 'openapi-v2.yml', '--root', root, '--fail-on-breaking']);
+    expect(diffFail.exitCode).toBe(1);
+    expect(diffFail.stdout).toContain('[BREAKING]');
+  });
+
+  it('redirects oversized endpoints/index and schemas/index (>64 KB) to paginated search', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'openapi-softcap-'));
+    tempDirs.push(root);
+
+    const paths: Record<string, unknown> = {};
+    const schemas: Record<string, unknown> = {};
+    for (let i = 0; i < 160; i++) {
+      paths[`/v1/resources/item-${i}`] = {
+        get: {
+          operationId: `getResourceItem${i}`,
+          tags: ['Catalog'],
+          summary: `Retrieve detailed resource item ${i} with extended metadata and audit status`,
+          responses: {
+            '200': { description: 'OK' },
+            '404': { description: 'Not found', content: { 'application/json': { schema: { $ref: `#/components/schemas/Model${i}` } } } },
+          },
+        },
+      };
+      schemas[`Model${i}`] = {
+        type: 'object',
+        description: `Schema model ${i} representing a catalog item with extended validation fields`,
+        required: ['id', 'name', 'status'],
+        properties: {
+          id: { type: 'string' },
+          name: { type: 'string' },
+          status: { type: 'string' },
+          extraFieldAlpha: { type: 'string' },
+          extraFieldBeta: { type: 'integer' },
+        },
+      };
+    }
+
+    writeFileSync(
+      join(root, 'openapi.json'),
+      JSON.stringify({ openapi: '3.1.0', info: { title: 'Large API', version: '1.0.0' }, paths, components: { schemas } })
+    );
+
+    const { client, close } = await connectClientServer(root);
+    try {
+      await expect(client.readResource({ uri: 'openapi://endpoints/index' })).rejects.toThrow(
+        /INDEX_LIMIT:.*openapi:\/\/endpoints\/search\?limit=20/
+      );
+      await expect(client.readResource({ uri: 'openapi://schemas/index' })).rejects.toThrow(
+        /INDEX_LIMIT:.*openapi:\/\/schemas\/search\?limit=20/
+      );
+
+      // Follow the redirected search resources
+      const epPage = await client.readResource({ uri: 'openapi://endpoints/search?limit=20' });
+      const epJson = JSON.parse((epPage.contents[0] as { text: string }).text);
+      expect(epJson.totalMatches).toBe(160);
+      expect(epJson.endpoints).toHaveLength(20);
+      expect(epJson.nextUri).toContain('offset=20');
+
+      const schemaPage = await client.readResource({ uri: 'openapi://schemas/search?limit=20' });
+      const schemaJson = JSON.parse((schemaPage.contents[0] as { text: string }).text);
+      expect(schemaJson.totalMatches).toBe(160);
+      expect(schemaJson.schemas).toHaveLength(20);
+      expect(schemaJson.nextUri).toContain('offset=20');
+    } finally {
+      await close();
+    }
   });
 });
