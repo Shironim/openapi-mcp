@@ -1,8 +1,9 @@
 import { createHash } from 'node:crypto';
 import { closeSync, constants, fstatSync, openSync, readSync, realpathSync, statSync } from 'node:fs';
 import { dirname, isAbsolute, relative, resolve, sep } from 'node:path';
-import { parse as parseYaml } from 'yaml';
 import { isRecord } from './json.js';
+import { parseDocumentWithLocations, type SourceLocation } from './source-map.js';
+import type { SchemaUsageRef } from './schema-index.js';
 
 export const DEFAULT_SPEC_CANDIDATES = [
   'openapi.yml', 'openapi.yaml', 'openapi.json',
@@ -11,7 +12,7 @@ export const DEFAULT_SPEC_CANDIDATES = [
 ] as const;
 
 export const MAX_SPEC_BYTES = 8 * 1024 * 1024;
-const MAX_SPEC_FILES = 128;
+export const MAX_SPEC_FILES = 128;
 const MAX_NODE_VISITS = 250_000;
 const MAX_DEPTH = 128;
 const MAX_CACHED_SPECS = 8;
@@ -26,6 +27,8 @@ export class MissingReferenceError extends Error {
 export interface FileFingerprint {
   filePath: string;
   mtimeMs: number;
+  ctimeMs: number;
+  size: number;
   sha256: string;
 }
 
@@ -36,6 +39,8 @@ export interface LoadedOpenApiSpec {
   cacheKey: string;
   fromCache: boolean;
   dependencies: FileFingerprint[];
+  sourceLocations: Readonly<Record<string, SourceLocation>>;
+  schemaUsages: Readonly<Record<string, readonly SchemaUsageRef[]>>;
 }
 
 export interface LoadOpenApiSpecOptions {
@@ -49,7 +54,7 @@ interface CachedSpec {
   locations: Map<string, string>;
 }
 
-interface FileSnapshot {
+export interface FileSnapshot {
   fingerprint: FileFingerprint;
   content: string;
   size: number;
@@ -144,11 +149,20 @@ function discoverSpec(root: string, rawRoot: string, explicitPath?: string): str
   );
 }
 
+export function assertWorkspaceRoot(rootInput: string, allowedRootDir?: string): string {
+  const root = resolveRoot(rootInput);
+  if (allowedRootDir && allowedRootDir !== rootInput &&
+      !isPathInside(resolveRoot(allowedRootDir), root)) {
+    throw new Error('PATH_TRAVERSAL_DENIED: Requested root is outside the configured workspace.');
+  }
+  return root;
+}
+
 export function findOpenApiSpecFile(rootDir: string, explicitPath?: string): string {
   return discoverSpec(resolveRoot(rootDir), rootDir, explicitPath);
 }
 
-function readSnapshot(path: string, availableBytes: number): FileSnapshot {
+export function readBoundedFileSnapshot(path: string, availableBytes: number): FileSnapshot {
   const fd = openSync(path, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0) | (constants.O_NOFOLLOW ?? 0));
   try {
     const before = fstatSync(fd);
@@ -170,6 +184,8 @@ function readSnapshot(path: string, availableBytes: number): FileSnapshot {
       fingerprint: {
         filePath: path,
         mtimeMs: after.mtimeMs,
+        ctimeMs: after.ctimeMs,
+        size: count,
         sha256: createHash('sha256').update(content).digest('hex'),
       },
       content: content.toString('utf8'),
@@ -180,29 +196,40 @@ function readSnapshot(path: string, availableBytes: number): FileSnapshot {
   }
 }
 
-function resolvePointer(document: unknown, fragment: string, ref: string): unknown {
+export function resolveJsonPointerSafe(
+  document: unknown,
+  fragment: string
+): { ok: true; value: unknown } | { ok: false; reason: string } {
   let pointer: string;
   try {
     pointer = decodeURIComponent(fragment);
   } catch {
-    throw new Error(`INVALID_REF: Invalid URI encoding in '${ref}'.`);
+    return { ok: false, reason: 'Invalid URI encoding in JSON Pointer.' };
   }
-  if (pointer === '') return document;
-  if (!pointer.startsWith('/')) throw new Error(`INVALID_REF: '${ref}' must use a JSON Pointer fragment.`);
+  if (pointer === '') return { ok: true, value: document };
+  if (!pointer.startsWith('/')) return { ok: false, reason: 'Fragment must use a JSON Pointer starting with "/".' };
 
   let value = document;
   for (const segment of pointer.slice(1).split('/')) {
-    if (/~(?![01])/.test(segment)) throw new Error(`INVALID_REF: Invalid pointer escape in '${ref}'.`);
+    if (/~(?![01])/.test(segment)) return { ok: false, reason: `Invalid pointer escape in '${segment}'.` };
     const key = segment.replace(/~1/g, '/').replace(/~0/g, '~');
     if (Array.isArray(value) && /^(0|[1-9]\d*)$/.test(key) && Number(key) < value.length) {
       value = value[Number(key)];
     } else if (isRecord(value) && Object.hasOwn(value, key)) {
       value = value[key];
     } else {
-      throw new Error(`INVALID_REF: Unresolved JSON Pointer '${ref}' at '${key}'.`);
+      return { ok: false, reason: `Unresolved JSON Pointer segment '${key}'.` };
     }
   }
-  return value;
+  return { ok: true, value };
+}
+
+function resolvePointer(document: unknown, fragment: string, ref: string): unknown {
+  const result = resolveJsonPointerSafe(document, fragment);
+  if (!result.ok) {
+    throw new Error(`INVALID_REF: '${ref}': ${result.reason}`);
+  }
+  return result.value;
 }
 
 export function deepFreeze<T>(value: T, seen = new WeakSet<object>()): T {
@@ -224,6 +251,60 @@ const annotations = new Set([
   'title', 'description', '$comment', 'examples', 'example', 'default', 'deprecated',
   'readOnly', 'writeOnly', 'externalDocs', 'xml',
 ]);
+
+const OPERATION_METHODS = new Set(['get', 'post', 'put', 'patch', 'delete', 'options', 'head', 'trace']);
+
+interface OperationContext {
+  method: string;
+  path: string;
+  section?: string;
+}
+
+function decodePointerSegment(segment: string): string {
+  return segment.replace(/~1/g, '/').replace(/~0/g, '~');
+}
+
+function extractLocalSchemaName(fragment: string): string | undefined {
+  for (const prefix of ['/components/schemas/', '/definitions/']) {
+    if (fragment.startsWith(prefix)) {
+      const rest = fragment.slice(prefix.length);
+      const firstSegment = rest.split('/')[0];
+      if (!firstSegment) return undefined;
+      try {
+        return decodePointerSegment(decodeURIComponent(firstSegment));
+      } catch {
+        return decodePointerSegment(firstSegment);
+      }
+    }
+  }
+  return undefined;
+}
+
+function nextOperationContext(
+  current: OperationContext | undefined,
+  inEntryFile: boolean,
+  pointer: string,
+  key: string
+): OperationContext | undefined {
+  if (!inEntryFile) return current;
+  if (!current) {
+    if (pointer.startsWith('/paths/')) {
+      const segments = pointer.slice('/paths/'.length).split('/');
+      if (segments.length === 1 && OPERATION_METHODS.has(key.toLowerCase())) {
+        return { method: key.toUpperCase(), path: decodePointerSegment(segments[0]!) };
+      }
+    }
+    return undefined;
+  }
+  if (current.section) return current;
+  if (key === 'requestBody' || key === 'parameters') {
+    return { ...current, section: key };
+  }
+  if (pointer.endsWith('/responses')) {
+    return { ...current, section: `response:${key}` };
+  }
+  return current;
+}
 
 function childPosition(parent: Position, key: string, pointer: string): Position {
   if (parent === 'named-map') return 'document';
@@ -249,11 +330,7 @@ function childPosition(parent: Position, key: string, pointer: string): Position
  */
 export function loadOpenApiSpec(options: LoadOpenApiSpecOptions = {}): LoadedOpenApiSpec {
   const rootInput = options.rootDir?.trim() || process.cwd();
-  const root = resolveRoot(rootInput);
-  if (options.allowedRootDir && options.allowedRootDir !== rootInput &&
-      !isPathInside(resolveRoot(options.allowedRootDir), root)) {
-    throw new Error('PATH_TRAVERSAL_DENIED: Requested root is outside the configured workspace.');
-  }
+  const root = assertWorkspaceRoot(rootInput, options.allowedRootDir);
   const entry = discoverSpec(root, rootInput, options.specPath);
   const snapshots = new Map<string, FileSnapshot>();
   let remainingBytes = MAX_SPEC_BYTES;
@@ -262,37 +339,57 @@ export function loadOpenApiSpec(options: LoadOpenApiSpecOptions = {}): LoadedOpe
     const existing = snapshots.get(path);
     if (existing) return existing;
     if (snapshots.size >= MAX_SPEC_FILES) throw new Error(`SPEC_LIMIT: At most ${MAX_SPEC_FILES} source files are supported.`);
-    const loaded = readSnapshot(path, remainingBytes);
+    const loaded = readBoundedFileSnapshot(path, remainingBytes);
     remainingBytes -= loaded.size;
     snapshots.set(path, loaded);
     return loaded;
   }
 
-  const cached = specCache.get(entry);
+  const cacheId = `${root}\0${entry}`;
+  const cached = specCache.get(cacheId);
   if (cached?.loaded.rootDir === root) {
-    const locationsMatch = [...cached.locations].every(([alias, canonical]) =>
-      resolveFile(alias, root, root)?.canonical === canonical
-    );
-    const fresh = locationsMatch && cached.loaded.dependencies.every((dependency) => {
-      const { mtimeMs, sha256 } = snapshot(dependency.filePath).fingerprint;
-      return mtimeMs === dependency.mtimeMs && sha256 === dependency.sha256;
-    });
-    specCache.delete(entry);
+    let fresh = false;
+    try {
+      const locationsMatch = [...cached.locations].every(([alias, canonical]) =>
+        resolveFile(alias, root, root)?.canonical === canonical
+      );
+      fresh = locationsMatch && cached.loaded.dependencies.every((dependency) => {
+        // Fast-path O(1) stat check avoids re-reading and hashing unchanged files on every query.
+        const st = statSync(dependency.filePath);
+        if (st.mtimeMs === dependency.mtimeMs && st.ctimeMs === dependency.ctimeMs && st.size === dependency.size) {
+          return true;
+        }
+        const { mtimeMs, sha256 } = snapshot(dependency.filePath).fingerprint;
+        return mtimeMs === dependency.mtimeMs && sha256 === dependency.sha256;
+      });
+    } catch (error) {
+      if (!isMissing(error) && !(error instanceof Error && error.message.startsWith('SPEC_CHANGED:'))) {
+        throw error;
+      }
+      fresh = false;
+    }
+    specCache.delete(cacheId);
     if (fresh) {
-      specCache.set(entry, cached);
+      specCache.set(cacheId, cached);
       return { ...cached.loaded, fromCache: true };
     }
+    // Reset snapshot accounting so deleted/unused dependencies from the stale cache do not consume byte budget.
+    snapshots.clear();
+    remainingBytes = MAX_SPEC_BYTES;
   }
 
   const parsedFiles = new Map<string, unknown>();
+  const fileSourceLocations = new Map<string, Map<string, SourceLocation>>();
   const locations = new Map<string, string>();
   function parseFile(path: string): unknown {
     if (parsedFiles.has(path)) return parsedFiles.get(path);
     const file = snapshot(path);
     try {
-      const parsed: unknown = parseYaml(file.content);
-      parsedFiles.set(path, parsed);
-      return parsed;
+      const relFile = relative(root, path).replace(/\\/g, '/');
+      const parsedDoc = parseDocumentWithLocations(file.content, relFile);
+      parsedFiles.set(path, parsedDoc.value);
+      fileSourceLocations.set(path, parsedDoc.locations);
+      return parsedDoc.value;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       throw new Error(`SPEC_PARSE_ERROR: Failed to parse '${path}': ${message.slice(0, 400)}`);
@@ -303,15 +400,37 @@ export function loadOpenApiSpec(options: LoadOpenApiSpecOptions = {}): LoadedOpe
   if (!isRecord(document)) throw new Error(`SPEC_PARSE_ERROR: Entry specification '${entry}' must be an object.`);
   const schema31 = typeof document.openapi === 'string' && /^3\.(?:[1-9]|\d{2,})\./.test(document.openapi);
   const ancestors = new WeakSet<object>();
+  const schemaUsageMap = new Map<string, Map<string, SchemaUsageRef>>();
   let visits = 0;
   let expandedBytes = 0;
+
+  function recordSchemaUsage(schemaName: string, opCtx: OperationContext | undefined): void {
+    if (!opCtx) return;
+    const section = opCtx.section ?? 'operation';
+    const key = `${opCtx.method} ${opCtx.path}\0${section}`;
+    let usages = schemaUsageMap.get(schemaName);
+    if (!usages) {
+      usages = new Map<string, SchemaUsageRef>();
+      schemaUsageMap.set(schemaName, usages);
+    }
+    if (!usages.has(key)) {
+      usages.set(key, { method: opCtx.method, path: opCtx.path, section });
+    }
+  }
 
   function countBytes(bytes: number): void {
     expandedBytes += bytes;
     if (expandedBytes > MAX_SPEC_BYTES) throw new Error(`SPEC_LIMIT: Expanded spec exceeds ${MAX_SPEC_BYTES} bytes.`);
   }
 
-  function expand(node: unknown, file: string, pointer: string, depth: number, position: Position): unknown {
+  function expand(
+    node: unknown,
+    file: string,
+    pointer: string,
+    depth: number,
+    position: Position,
+    opCtx?: OperationContext
+  ): unknown {
     if (++visits > MAX_NODE_VISITS || depth > MAX_DEPTH) {
       throw new Error(`SPEC_LIMIT: Spec expansion exceeds ${MAX_NODE_VISITS} nodes or ${MAX_DEPTH} levels.`);
     }
@@ -330,7 +449,7 @@ export function loadOpenApiSpec(options: LoadOpenApiSpecOptions = {}): LoadedOpe
     try {
       if (Array.isArray(node)) {
         const itemPosition = position === 'schema-list' ? 'schema' : position;
-        return node.map((item, index) => expand(item, file, `${pointer}/${index}`, depth + 1, itemPosition));
+        return node.map((item, index) => expand(item, file, `${pointer}/${index}`, depth + 1, itemPosition, opCtx));
       }
 
       const prototype = Object.getPrototypeOf(node);
@@ -343,11 +462,13 @@ export function loadOpenApiSpec(options: LoadOpenApiSpecOptions = {}): LoadedOpe
       }
       const ref = position !== 'literal' && typeof object.$ref === 'string' ? object.$ref.trim() : undefined;
       const siblings = Object.entries(object).filter(([key]) => ref === undefined || key !== '$ref');
+      const inEntryFile = file === entry;
       const expandEntries = (entries: [string, unknown][]) => Object.fromEntries(entries.map(([key, value]) => {
         countBytes(Buffer.byteLength(JSON.stringify(key)));
         const escaped = key.replace(/~/g, '~0').replace(/\//g, '~1');
         const next = position === 'literal' ? 'literal' : childPosition(position, key, pointer);
-        return [key, expand(value, file, `${pointer}/${escaped}`, depth + 1, next)];
+        const nextOp = nextOperationContext(opCtx, inEntryFile, pointer, key);
+        return [key, expand(value, file, `${pointer}/${escaped}`, depth + 1, next, nextOp)];
       }));
 
       if (ref === undefined) return expandEntries(siblings);
@@ -361,13 +482,17 @@ export function loadOpenApiSpec(options: LoadOpenApiSpecOptions = {}): LoadedOpe
         locations.set(location.candidate, location.canonical);
         targetFile = location.canonical;
       }
+      if (targetFile === entry && opCtx) {
+        const schemaName = extractLocalSchemaName(fragment);
+        if (schemaName) recordSchemaUsage(schemaName, opCtx);
+      }
       const target = resolvePointer(parseFile(targetFile), fragment, ref);
       if (target !== null && typeof target === 'object' && ancestors.has(target)) {
         countBytes(Buffer.byteLength(ref));
         return `[Circular: ${ref}]`;
       }
 
-      const resolved = expand(target, targetFile, fragment, depth + 1, position);
+      const resolved = expand(target, targetFile, fragment, depth + 1, position, opCtx);
       if (siblings.length === 0) return resolved;
 
       if (schema31 && position === 'schema') {
@@ -393,10 +518,24 @@ export function loadOpenApiSpec(options: LoadOpenApiSpecOptions = {}): LoadedOpe
   snapshotJson.set(spec, serializeSpec(spec));
   const dependencies = [...parsedFiles.keys()].map((path) => snapshot(path).fingerprint);
   const cacheKey = createHash('sha256').update(JSON.stringify(dependencies)).digest('hex');
-  // Freeze the cache's validation inputs too, so library callers cannot mutate its freshness checks.
+
+  const entryLocations = fileSourceLocations.get(entry);
+  const sourceLocations: Record<string, SourceLocation> = entryLocations
+    ? Object.fromEntries(entryLocations.entries())
+    : {};
+  const schemaUsages: Record<string, SchemaUsageRef[]> = {};
+  for (const [schemaName, usages] of schemaUsageMap.entries()) {
+    schemaUsages[schemaName] = [...usages.values()].sort((a, b) =>
+      `${a.method} ${a.path} ${a.section}`.localeCompare(`${b.method} ${b.path} ${b.section}`)
+    );
+  }
+
+  // Freeze the cache's validation inputs and metadata so library callers cannot mutate them.
   deepFreeze(dependencies);
-  const loaded = { spec, specPath: entry, rootDir: root, dependencies, cacheKey };
-  specCache.set(entry, { loaded, locations });
+  deepFreeze(sourceLocations);
+  deepFreeze(schemaUsages);
+  const loaded = { spec, specPath: entry, rootDir: root, dependencies, cacheKey, sourceLocations, schemaUsages };
+  specCache.set(cacheId, { loaded, locations });
   if (specCache.size > MAX_CACHED_SPECS) specCache.delete(specCache.keys().next().value!);
   return { ...loaded, fromCache: false };
 }

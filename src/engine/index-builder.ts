@@ -1,4 +1,5 @@
 import { isRecord } from './json.js';
+import { escapeJsonPointer, type SourceLocation } from './source-map.js';
 
 export const HTTP_METHODS = [
   'get',
@@ -17,9 +18,12 @@ export interface EndpointSummaryItem {
   operationId?: string;
   summary: string;
   tags?: string[];
+  deprecated?: boolean;
+  security?: string[];
   statusCodes: string[];
   errorStatusCodes: string[];
   errorBodies: Record<string, { schemaMediaTypes: string[]; hasSwaggerSchema?: boolean }>;
+  sourceLocation?: SourceLocation;
   line: string;
 }
 
@@ -29,10 +33,22 @@ export interface EndpointIndex {
   openapiVersion: string;
   specPath?: string;
   totalEndpoints: number;
+  tags: string[];
   endpointsWithErrorContracts: number;
   endpointsMissingErrorContracts: string[];
   lines: string[];
   endpoints: EndpointSummaryItem[];
+}
+
+export interface EndpointSearchFilters {
+  q?: string;
+  tag?: string;
+  method?: string;
+  pathPrefix?: string;
+  operationId?: string;
+  missingErrorContracts?: boolean;
+  offset: number;
+  limit: number;
 }
 
 function sortStatusCodes(codes: string[]): string[] {
@@ -46,24 +62,40 @@ function sortStatusCodes(codes: string[]): string[] {
   });
 }
 
-export function searchEndpoints(entries: EndpointSummaryItem[], filters: {
-  q?: string; tag?: string; operationId?: string; offset: number; limit: number;
-}) {
+export function searchEndpoints(entries: EndpointSummaryItem[], filters: EndpointSearchFilters) {
   const query = filters.q?.toLowerCase();
   const tag = filters.tag?.toLowerCase();
+  const method = filters.method?.toUpperCase();
+  const pathPrefix = filters.pathPrefix;
   const operationId = filters.operationId?.toLowerCase();
   const endpoints: EndpointSummaryItem[] = [];
   let totalMatches = 0;
   for (const entry of entries) {
     const tags = entry.tags ?? [];
+    if (method && entry.method !== method) continue;
+    if (pathPrefix && !entry.path.startsWith(pathPrefix)) continue;
     if (tag && !tags.some(value => value.toLowerCase() === tag)) continue;
     if (operationId && entry.operationId?.toLowerCase() !== operationId) continue;
+    if (filters.missingErrorContracts === true && entry.errorStatusCodes.length > 0) continue;
+    if (filters.missingErrorContracts === false && entry.errorStatusCodes.length === 0) continue;
     if (query && ![entry.method, entry.path, entry.summary, entry.operationId ?? '', ...tags]
       .some(value => value.toLowerCase().includes(query))) continue;
     if (totalMatches >= filters.offset && endpoints.length < filters.limit) endpoints.push(entry);
     totalMatches++;
   }
   return { endpoints, totalMatches };
+}
+
+function extractSecuritySchemes(securityField: unknown): string[] | undefined {
+  if (!Array.isArray(securityField)) return undefined;
+  const schemes = new Set<string>();
+  for (const requirement of securityField) {
+    if (!isRecord(requirement)) continue;
+    for (const schemeName of Object.keys(requirement)) {
+      if (schemeName.trim()) schemes.add(schemeName);
+    }
+  }
+  return [...schemes].sort();
 }
 
 function isErrorStatusCode(code: string): boolean {
@@ -91,7 +123,11 @@ function extractSummary(operation: Record<string, unknown>): string {
  * Builds a compact, token-lean index of all endpoints and their defined HTTP status codes
  * (including all 4xx/5xx error responses) from a resolved OpenAPI specification.
  */
-export function buildEndpointIndex(spec: Record<string, unknown>, specPath?: string): EndpointIndex {
+export function buildEndpointIndex(
+  spec: Record<string, unknown>,
+  specPath?: string,
+  sourceLocations?: Readonly<Record<string, SourceLocation>>
+): EndpointIndex {
   const info = isRecord(spec.info) ? spec.info : {};
   const title = typeof info.title === 'string' && info.title.trim() ? info.title.trim() : 'Untitled API';
   const version = typeof info.version === 'string' && info.version.trim() ? info.version.trim() : 'unknown';
@@ -103,8 +139,10 @@ export function buildEndpointIndex(spec: Record<string, unknown>, specPath?: str
         : 'unknown';
 
   const pathsObj = isRecord(spec.paths) ? spec.paths : {};
+  const globalSecurity = extractSecuritySchemes(spec.security);
   const endpoints: EndpointSummaryItem[] = [];
   const endpointsMissingErrorContracts: string[] = [];
+  const allTags = new Set<string>();
 
   for (const pathKey of Object.keys(pathsObj)) {
     const pathItem = pathsObj[pathKey];
@@ -137,11 +175,22 @@ export function buildEndpointIndex(spec: Record<string, unknown>, specPath?: str
       const tags = Array.isArray(operation.tags)
         ? operation.tags.filter((t): t is string => typeof t === 'string' && t.trim().length > 0)
         : undefined;
+      if (tags) {
+        for (const t of tags) allTags.add(t);
+      }
 
       const operationId =
         typeof operation.operationId === 'string' && operation.operationId.trim()
           ? operation.operationId.trim()
           : undefined;
+
+      const deprecated = operation.deprecated === true;
+      const opSecurity = extractSecuritySchemes(operation.security);
+      const effectiveSecurity = opSecurity !== undefined ? opSecurity : globalSecurity;
+      const includeSecurity =
+        effectiveSecurity !== undefined && (effectiveSecurity.length > 0 || (opSecurity !== undefined && (globalSecurity?.length ?? 0) > 0));
+
+      const sourceLocation = sourceLocations?.[`/paths/${escapeJsonPointer(pathKey)}/${httpMethod}`];
 
       const statusList = statusCodes.length > 0 ? statusCodes.join(', ') : 'none';
       const line = `${method} ${pathKey} — ${summary} — [${statusList}]`;
@@ -152,9 +201,12 @@ export function buildEndpointIndex(spec: Record<string, unknown>, specPath?: str
         ...(operationId ? { operationId } : {}),
         summary,
         ...(tags && tags.length > 0 ? { tags } : {}),
+        ...(deprecated ? { deprecated: true } : {}),
+        ...(includeSecurity ? { security: effectiveSecurity } : {}),
         statusCodes,
         errorStatusCodes,
         errorBodies,
+        ...(sourceLocation ? { sourceLocation } : {}),
         line,
       });
     }
@@ -166,6 +218,7 @@ export function buildEndpointIndex(spec: Record<string, unknown>, specPath?: str
     openapiVersion,
     ...(specPath ? { specPath } : {}),
     totalEndpoints: endpoints.length,
+    tags: [...allTags].sort(),
     endpointsWithErrorContracts: endpoints.length - endpointsMissingErrorContracts.length,
     endpointsMissingErrorContracts,
     lines: endpoints.map((e) => e.line),
