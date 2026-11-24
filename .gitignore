@@ -2,3 +2,10 @@ node_modules/
 dist/
 release/
 *.log
+
+# Strata AST cache
+.strata/
+
+# Septum local database and cache
+.septum/*.db*
+.septum/
