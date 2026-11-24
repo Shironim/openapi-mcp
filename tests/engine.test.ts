@@ -1,14 +1,23 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import {
   DEFAULT_MAX_BYTES,
   buildEndpointIndex,
+  buildSchemaIndex,
   clearSpecCache,
+  diagnoseOpenApiSpec,
+  diffOpenApiSpecs,
   enforceByteBudget,
+  generateOperationExamples,
+  generateSchemaExample,
+  getMergedOperation,
   loadOpenApiSpec,
   runSandboxQuery,
+  scanWorkspaceSpecs,
+  searchEndpoints,
+  searchSchemas,
 } from '../src/engine/index';
 
 const tempDirs: string[] = [];
@@ -573,5 +582,382 @@ describe('Core Engine — Index Builder, Read-Only Sandbox & Byte Budget', () =>
     spec.info.title = 'Second';
     expect(runSandboxQuery(spec, 'spec.info.title').value).toBe('Second');
     expect(() => runSandboxQuery(spec, '"a".repeat(1100000)', { timeoutMs: 1000 })).toThrow(/SANDBOX_LIMIT/);
+  });
+
+  it('skips unreadable directories (EACCES) and default ignored folders during catalog scan', () => {
+    const { root, write } = createWorkspace();
+    write('services/orders/openapi.yml', 'openapi: "3.1.0"\ninfo:\n  title: Orders\n  version: "1"\npaths: {}\n');
+    write('vendor/pkg/openapi.yml', 'openapi: "3.1.0"\ninfo:\n  title: Ignored\n  version: "1"\npaths: {}\n');
+    write('dist/openapi.json', '{"openapi":"3.1.0"}');
+    const lockedDir = join(root, 'locked-volume');
+    mkdirSync(lockedDir, { recursive: true });
+    if (process.platform !== 'win32' && process.getuid?.() !== 0) {
+      chmodSync(lockedDir, 0o000);
+    }
+    try {
+      const catalog = scanWorkspaceSpecs(root);
+      expect(catalog.specPaths).toEqual(['services/orders/openapi.yml']);
+      if (process.platform !== 'win32' && process.getuid?.() !== 0) {
+        expect(catalog.skippedDirCount).toBe(1);
+        expect(catalog.skippedDirs).toEqual(['locked-volume']);
+      }
+    } finally {
+      if (process.platform !== 'win32') {
+        chmodSync(lockedDir, 0o755);
+      }
+    }
+  });
+
+  it('invalidates warm cache cleanly when a referenced file is deleted and reports MissingReferenceError', () => {
+    const { root, write } = createWorkspace();
+    const errFile = write('schemas/err.yml', 'Err:\n  type: object\n  properties:\n    msg:\n      type: string\n');
+    write(
+      'openapi.yml',
+      `openapi: "3.1.0"
+info:
+  title: Warm Delete
+  version: "1.0.0"
+paths:
+  /ping:
+    get:
+      responses:
+        "500":
+          description: Error
+          content:
+            application/json:
+              schema:
+                $ref: "./schemas/err.yml#/Err"
+`
+    );
+    expect(loadOpenApiSpec({ rootDir: root }).fromCache).toBe(false);
+    expect(loadOpenApiSpec({ rootDir: root }).fromCache).toBe(true);
+    unlinkSync(errFile);
+    expect(() => loadOpenApiSpec({ rootDir: root })).toThrow(/REF_FILE_NOT_FOUND/);
+  });
+
+  it('tracks YAML source locations, schema index reverse references, security, and search filters', () => {
+    const { root, write } = createWorkspace();
+    write(
+      'openapi.yml',
+      `openapi: "3.1.0"
+info:
+  title: Shop API
+  version: "2.0.0"
+security:
+  - bearerAuth: []
+paths:
+  /orders/{orderId}:
+    parameters:
+      - name: orderId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    get:
+      operationId: getOrder
+      tags: [Orders]
+      summary: Get an order
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Order"
+        "404":
+          description: Not found
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+  /health:
+    get:
+      summary: Public health
+      security: []
+      deprecated: true
+      responses:
+        "200":
+          description: OK
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  schemas:
+    Order:
+      type: object
+      required: [id, customer]
+      properties:
+        id:
+          type: string
+          format: uuid
+        customer:
+          $ref: "#/components/schemas/Customer"
+    Customer:
+      type: object
+      required: [email]
+      properties:
+        email:
+          type: string
+          format: email
+    Problem:
+      type: object
+      required: [title, status]
+      properties:
+        title:
+          type: string
+        status:
+          type: integer
+    UnusedModel:
+      type: object
+      properties:
+        note:
+          type: string
+`
+    );
+
+    const loaded = loadOpenApiSpec({ rootDir: root });
+    const epIndex = buildEndpointIndex(loaded.spec, loaded.specPath, loaded.sourceLocations);
+    expect(epIndex.tags).toEqual(['Orders']);
+    const getOrder = epIndex.endpoints.find((e) => e.operationId === 'getOrder')!;
+    expect(getOrder.security).toEqual(['bearerAuth']);
+    expect(getOrder.sourceLocation?.file).toBe('openapi.yml');
+    expect(getOrder.sourceLocation?.line).toBeGreaterThan(10);
+
+    const health = epIndex.endpoints.find((e) => e.path === '/health')!;
+    expect(health.deprecated).toBe(true);
+    expect(health.security).toEqual([]);
+
+    expect(searchEndpoints(epIndex.endpoints, { method: 'GET', pathPrefix: '/orders', offset: 0, limit: 10 }).totalMatches).toBe(1);
+    expect(searchEndpoints(epIndex.endpoints, { missingErrorContracts: true, offset: 0, limit: 10 }).totalMatches).toBe(1);
+
+    const schemaIdx = buildSchemaIndex(loaded.spec, loaded.specPath, loaded.sourceLocations, loaded.schemaUsages);
+    expect(schemaIdx.totalSchemas).toBe(4);
+    expect(schemaIdx.unusedSchemas).toEqual(['UnusedModel']);
+    const customer = schemaIdx.schemas.find((s) => s.name === 'Customer')!;
+    expect(customer.usedBy).toEqual(['GET /orders/{orderId} (response:200)']);
+    expect(customer.sourceLocation?.line).toBeGreaterThan(40);
+    expect(searchSchemas(schemaIdx.schemas, { unusedOnly: true, offset: 0, limit: 10 }).schemas.map((s) => s.name)).toEqual(['UnusedModel']);
+
+    // Merged operation & deterministic example generator
+    const mergedOp = getMergedOperation(loaded.spec, 'GET', '/orders/{orderId}', loaded.sourceLocations)!;
+    expect(mergedOp.parameters).toHaveLength(1);
+    expect(mergedOp.security).toEqual([{ bearerAuth: [] }]);
+
+    const examples = generateOperationExamples(loaded.spec, 'GET', '/orders/{orderId}', '200')!;
+    expect(examples.responses['200']?.example).toEqual({
+      id: '00000000-0000-4000-8000-000000000000',
+      customer: { email: 'user@example.com' },
+    });
+
+    // Circular marker safety in example generator
+    expect(generateSchemaExample({ type: 'object', properties: { self: '[Circular: #/Node]' } })).toEqual({ self: null });
+
+    // Sandbox helpers parity
+    const helperRes = runSandboxQuery(loaded.spec, "helpers.example('GET', '/orders/{orderId}', '200')", {
+      metadata: { sourceLocations: loaded.sourceLocations, schemaUsages: loaded.schemaUsages },
+    }).value as any;
+    expect(helperRes.responses['200'].example.customer.email).toBe('user@example.com');
+
+    const refsRes = runSandboxQuery(loaded.spec, "helpers.schemaRefs('Customer')", {
+      metadata: { sourceLocations: loaded.sourceLocations, schemaUsages: loaded.schemaUsages },
+    }).value as any;
+    expect(refsRes).toEqual([{ method: 'GET', path: '/orders/{orderId}', section: 'response:200' }]);
+  });
+
+  it('diagnoses multiple contract issues in one pass without failing on the first broken $ref', () => {
+    const { root, write } = createWorkspace();
+    write(
+      'openapi.yml',
+      `openapi: "3.1.0"
+info:
+  title: Broken API
+  version: "1.0.0"
+paths:
+  /orders/{orderId}:
+    get:
+      operationId: dupOp
+      security:
+        - ghostAuth: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "./missing-a.yml#/Order"
+        "400":
+          description: Bad request without schema
+  /items:
+    get:
+      operationId: dupOp
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DoesNotExist"
+`
+    );
+
+    const report = diagnoseOpenApiSpec({ rootDir: root });
+    expect(report.valid).toBe(false);
+    const codes = new Set(report.issues.map((i) => i.code));
+    expect(codes.has('BROKEN_REF')).toBe(true);
+    expect(report.issues.filter((i) => i.code === 'BROKEN_REF').length).toBe(2);
+    expect(codes.has('DUPLICATE_OPERATION_ID')).toBe(true);
+    expect(codes.has('UNDECLARED_PATH_PARAMETER')).toBe(true);
+    expect(codes.has('UNKNOWN_SECURITY_SCHEME')).toBe(true);
+    expect(codes.has('MISSING_ERROR_CONTRACT')).toBe(true);
+    expect(codes.has('ERROR_RESPONSE_MISSING_SCHEMA')).toBe(true);
+  });
+
+  it('classifies breaking vs non-breaking changes accurately in diffOpenApiSpecs', () => {
+    const base = {
+      openapi: '3.1.0',
+      info: { title: 'API', version: '1.0' },
+      paths: {
+        '/orders': {
+          post: {
+            requestBody: {
+              required: false,
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['sku'],
+                    properties: {
+                      sku: { type: 'string' },
+                      note: { type: 'string' },
+                    },
+                  },
+                },
+              },
+            },
+            responses: {
+              '201': {
+                description: 'Created',
+                content: {
+                  'application/json': {
+                    schema: {
+                      type: 'object',
+                      required: ['id'],
+                      properties: { id: { type: 'string' } },
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+        '/legacy': {
+          get: { responses: { '200': { description: 'OK' } } },
+        },
+      },
+    };
+
+    const target = {
+      openapi: '3.1.0',
+      info: { title: 'API', version: '2.0' },
+      paths: {
+        '/orders': {
+          post: {
+            requestBody: {
+              required: true,
+              content: {
+                'application/json': {
+                  schema: {
+                    type: 'object',
+                    required: ['sku', 'qty'],
+                    properties: {
+                      sku: { type: 'string' },
+                      note: { type: 'string' },
+                      qty: { type: 'integer' },
+                      coupon: { type: 'string' },
+                    },
+                  },
+                },
+              },
+            },
+            responses: {
+              '201': {
+                description: 'Created',
+                content: {
+                  'application/json': {
+                    schema: {
+                      type: 'object',
+                      required: ['id'],
+                      properties: {
+                        id: { type: 'integer' },
+                        createdAt: { type: 'string' },
+                      },
+                    },
+                  },
+                },
+              },
+              '422': { description: 'Validation error' },
+            },
+          },
+        },
+        '/v2/health': {
+          get: { responses: { '200': { description: 'OK' } } },
+        },
+      },
+    };
+
+    const diff = diffOpenApiSpecs(base as any, target as any, { base: 'v1.yml', target: 'v2.yml' });
+    expect(diff.hasBreakingChanges).toBe(true);
+    expect(diff.summary.removedEndpoints).toBe(1);
+    expect(diff.summary.addedEndpoints).toBe(1);
+    const breakingCodes = new Set(diff.breaking.map((c) => c.code));
+    expect(breakingCodes.has('ENDPOINT_REMOVED')).toBe(true);
+    expect(breakingCodes.has('REQUEST_BODY_BECAME_REQUIRED')).toBe(true);
+    expect(breakingCodes.has('REQUEST_REQUIRED_PROPERTY_ADDED')).toBe(true);
+    expect(breakingCodes.has('RESPONSE_TYPE_CHANGED')).toBe(true);
+
+    const nonBreakingCodes = new Set(diff.nonBreaking.map((c) => c.code));
+    expect(nonBreakingCodes.has('ENDPOINT_ADDED')).toBe(true);
+    expect(nonBreakingCodes.has('REQUEST_OPTIONAL_PROPERTY_ADDED')).toBe(true);
+    expect(nonBreakingCodes.has('RESPONSE_PROPERTY_ADDED')).toBe(true);
+    expect(nonBreakingCodes.has('RESPONSE_STATUS_ADDED')).toBe(true);
+  });
+
+  it('enforces workspace boundary, file-count limit, and byte limit in diagnoseOpenApiSpec', () => {
+    const { root, write } = createWorkspace();
+    const outside = mkdtempSync(join(tmpdir(), 'openapi-diag-outside-'));
+    tempDirs.push(outside);
+    writeFileSync(join(outside, 'openapi.yml'), 'openapi: "3.1.0"\ninfo:\n  title: Outside\npaths: {}\n', 'utf8');
+
+    // allowedRootDir escape rejection
+    expect(() =>
+      diagnoseOpenApiSpec({ rootDir: outside, allowedRootDir: root })
+    ).toThrow(/PATH_TRAVERSAL_DENIED/);
+
+    // Oversized entry file (> MAX_SPEC_BYTES) reported cleanly as SPEC_PARSE_ERROR
+    write('huge.json', `{"openapi":"3.1.0","info":{"title":"${'x'.repeat(8 * 1024 * 1024 + 64)}"},"paths":{}}`);
+    const hugeReport = diagnoseOpenApiSpec({ rootDir: root, specPath: 'huge.json' });
+    expect(hugeReport.valid).toBe(false);
+    expect(hugeReport.issues[0]?.code).toBe('SPEC_PARSE_ERROR');
+    expect(hugeReport.issues[0]?.message).toContain('SPEC_LIMIT');
+
+    // Exceeding MAX_SPEC_FILES (128) across external $refs stops cleanly with REF_PARSE_ERROR
+    const pathsObj: Record<string, unknown> = {};
+    for (let i = 0; i < 130; i++) {
+      write(`refs/s${i}.json`, JSON.stringify({ type: 'string' }));
+      pathsObj[`/r${i}`] = {
+        get: {
+          responses: {
+            '200': { description: 'OK', content: { 'application/json': { schema: { $ref: `./refs/s${i}.json` } } } },
+            '400': { description: 'Err', content: { 'application/json': { schema: { type: 'object' } } } },
+          },
+        },
+      };
+    }
+    write('many.json', JSON.stringify({ openapi: '3.1.0', info: { title: 'Many', version: '1' }, paths: pathsObj }));
+    const manyReport = diagnoseOpenApiSpec({ rootDir: root, specPath: 'many.json' });
+    expect(manyReport.valid).toBe(false);
+    expect(manyReport.issues.some((i) => i.code === 'REF_PARSE_ERROR' && i.message.includes('SPEC_LIMIT'))).toBe(true);
   });
 });
